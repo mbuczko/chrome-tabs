@@ -1,59 +1,42 @@
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
+use chrome_tabs::*;
+
 const CACHE_TTL: Duration = Duration::from_secs(10);
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Browser ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
-struct Tab {
-    title: String,
-    url: String,
-    window_id: String, // Chrome's stable window id
-    window_index: usize,
-    tab_index: usize,
+#[derive(Clone, Copy)]
+enum Browser {
+    Chrome,
+    Brave,
 }
 
-#[derive(Debug, serde::Serialize, Clone)]
-struct Bookmark {
-    title: String,
-    url: String,
-    folder: String,
-}
+impl Browser {
+    fn app_name(self) -> &'static str {
+        match self {
+            Browser::Chrome => "Google Chrome",
+            Browser::Brave => "Brave Browser",
+        }
+    }
 
-#[derive(Debug, serde::Deserialize)]
-struct FocusRequest {
-    window_id: String,
-    tab_index: usize,
-}
-
-// Raw Chrome bookmark JSON shapes (only what we need)
-#[derive(Debug, serde::Deserialize)]
-struct BookmarkFile {
-    roots: BookmarkRoots,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct BookmarkRoots {
-    bookmark_bar: BookmarkNode,
-    other: BookmarkNode,
-    synced: BookmarkNode,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct BookmarkNode {
-    #[serde(rename = "type")]
-    kind: String,
-    name: String,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    children: Vec<BookmarkNode>,
+    fn bookmarks_path(self) -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let rel = match self {
+            Browser::Chrome => "Library/Application Support/Google/Chrome/Default/Bookmarks",
+            Browser::Brave => {
+                "Library/Application Support/BraveSoftware/Brave-Browser/Default/Bookmarks"
+            }
+        };
+        PathBuf::from(home).join(rel)
+    }
 }
 
 // ── Tab cache ────────────────────────────────────────────────────────────────
@@ -63,28 +46,32 @@ struct TabCache {
     fetched_at: Instant,
 }
 
-const JXA_GET_TABS: &str = r#"
-var app = Application("Google Chrome");
+fn jxa_get_tabs(browser: Browser) -> String {
+    format!(
+        r#"var app = Application("{app}");
 var result = [];
 var windows = app.windows();
-for (var wi = 0; wi < windows.length; wi++) {
+for (var wi = 0; wi < windows.length; wi++) {{
     var tabs = windows[wi].tabs();
-    for (var ti = 0; ti < tabs.length; ti++) {
-        result.push({
+    for (var ti = 0; ti < tabs.length; ti++) {{
+        result.push({{
             title: tabs[ti].title(),
             url: tabs[ti].url(),
             window_id: windows[wi].id(),
             window_index: wi,
             tab_index: ti
-        });
-    }
+        }});
+    }}
+}}
+JSON.stringify(result);"#,
+        app = browser.app_name()
+    )
 }
-JSON.stringify(result);
-"#;
 
-fn fetch_tabs() -> Result<Vec<Tab>, String> {
+fn fetch_tabs(browser: Browser, buf: &mut Vec<Tab>) -> Result<(), String> {
+    let script = jxa_get_tabs(browser);
     let output = Command::new("osascript")
-        .args(["-l", "JavaScript", "-e", JXA_GET_TABS])
+        .args(["-l", "JavaScript", "-e", &script])
         .output()
         .map_err(|e| format!("failed to run osascript: {e}"))?;
 
@@ -94,40 +81,36 @@ fn fetch_tabs() -> Result<Vec<Tab>, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("failed to parse JSON: {e}\nraw: {stdout}"))
+    let fresh: Vec<Tab> = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("failed to parse JSON: {e}\nraw: {stdout}"))?;
+
+    buf.clear();
+    buf.extend(fresh);
+    Ok(())
 }
 
-fn start_tab_refresher(cache: Arc<Mutex<Option<TabCache>>>) {
-    thread::spawn(move || loop {
-        match fetch_tabs() {
-            Ok(tabs) => {
-                let mut guard = cache.lock().unwrap();
-                *guard = Some(TabCache {
-                    tabs,
-                    fetched_at: Instant::now(),
-                });
+fn start_tab_refresher(browser: Browser, cache: Arc<RwLock<TabCache>>) {
+    thread::spawn(move || {
+        let mut buf = std::mem::take(&mut cache.write().unwrap().tabs);
+        loop {
+            match fetch_tabs(browser, &mut buf) {
+                Ok(()) => {
+                    let mut guard = cache.write().unwrap();
+                    std::mem::swap(&mut guard.tabs, &mut buf);
+                    guard.fetched_at = Instant::now();
+                }
+                Err(e) => eprintln!("tab cache refresh failed: {e}"),
             }
-            Err(e) => eprintln!("tab cache refresh failed: {e}"),
+            thread::sleep(CACHE_TTL);
         }
-        thread::sleep(CACHE_TTL);
     });
 }
 
-fn get_cached_tabs(cache: &Arc<Mutex<Option<TabCache>>>) -> Result<Vec<Tab>, String> {
-    let guard = cache.lock().unwrap();
-    match &*guard {
-        Some(c) => Ok(c.tabs.clone()),
-        None => Err("tab cache not yet populated, try again shortly".to_string()),
-    }
+fn get_cached_tabs(cache: &Arc<RwLock<TabCache>>) -> Vec<Tab> {
+    cache.read().unwrap().tabs.clone()
 }
 
 // ── Bookmarks ────────────────────────────────────────────────────────────────
-
-fn bookmarks_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join("Library/Application Support/Google/Chrome/Default/Bookmarks")
-}
 
 fn flatten_node(node: &BookmarkNode, folder: &str, out: &mut Vec<Bookmark>) {
     match node.kind.as_str() {
@@ -155,8 +138,8 @@ fn flatten_node(node: &BookmarkNode, folder: &str, out: &mut Vec<Bookmark>) {
     }
 }
 
-fn load_bookmarks() -> Result<Vec<Bookmark>, String> {
-    let path = bookmarks_path();
+fn load_bookmarks(browser: Browser) -> Result<Vec<Bookmark>, String> {
+    let path = browser.bookmarks_path();
     let data = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read bookmarks file {}: {e}", path.display()))?;
 
@@ -174,10 +157,9 @@ fn load_bookmarks() -> Result<Vec<Bookmark>, String> {
 
 // ── Focus tab ────────────────────────────────────────────────────────────────
 
-fn jxa_focus_tab(window_id: &str, tab_index: usize) -> String {
+fn jxa_focus_tab(browser: Browser, window_id: &str, tab_index: usize) -> String {
     format!(
-        r#"
-var app = Application("Google Chrome");
+        r#"var app = Application("{app}");
 var windows = app.windows();
 var win = null;
 for (var i = 0; i < windows.length; i++) {{
@@ -188,13 +170,14 @@ win.activeTabIndex = {ti} + 1;
 app.activate();
 win.index = 1;
 "#,
+        app = browser.app_name(),
         wid = window_id,
         ti = tab_index,
     )
 }
 
-fn focus_tab(window_id: &str, tab_index: usize) -> Result<(), String> {
-    let script = jxa_focus_tab(window_id, tab_index);
+fn focus_tab(browser: Browser, window_id: &str, tab_index: usize) -> Result<(), String> {
+    let script = jxa_focus_tab(browser, window_id, tab_index);
     let output = Command::new("osascript")
         .args(["-l", "JavaScript", "-e", &script])
         .output()
@@ -233,11 +216,16 @@ fn respond_error(request: tiny_http::Request, status: u16, message: &str) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
+    let browser = match std::env::args().nth(1).as_deref() {
+        Some("--brave") => Browser::Brave,
+        _ => Browser::Chrome,
+    };
+
     let addr = "127.0.0.1:9223";
     let server = Server::http(addr).expect("failed to start server");
 
     // Load bookmarks once at startup.
-    let bookmarks: Arc<Vec<Bookmark>> = Arc::new(match load_bookmarks() {
+    let bookmarks: Rc<Vec<Bookmark>> = Rc::new(match load_bookmarks(browser) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("warning: could not load bookmarks: {e}");
@@ -246,8 +234,11 @@ fn main() {
     });
 
     // Spawn background tab-refresher thread.
-    let tab_cache: Arc<Mutex<Option<TabCache>>> = Arc::new(Mutex::new(None));
-    start_tab_refresher(Arc::clone(&tab_cache));
+    let tab_cache: Arc<RwLock<TabCache>> = Arc::new(RwLock::new(TabCache {
+        tabs: Vec::with_capacity(300),
+        fetched_at: Instant::now(),
+    }));
+    start_tab_refresher(browser, Arc::clone(&tab_cache));
 
     println!("chrome-tabs listening on http://{addr}");
     println!("  GET  /tabs         - list open tabs (cached, refreshed every {CACHE_TTL:?})");
@@ -259,10 +250,9 @@ fn main() {
         let url = request.url().to_string();
 
         match (method, url.as_str()) {
-            (Method::Get, "/tabs") => match get_cached_tabs(&tab_cache) {
-                Ok(tabs) => respond_json(request, 200, &tabs),
-                Err(e) => respond_error(request, 503, &e),
-            },
+            (Method::Get, "/tabs") => {
+                respond_json(request, 200, &get_cached_tabs(&tab_cache));
+            }
 
             (Method::Get, "/bookmarks") => {
                 respond_json(request, 200, &*bookmarks);
@@ -276,7 +266,7 @@ fn main() {
                     continue;
                 }
                 match serde_json::from_str::<FocusRequest>(&body) {
-                    Ok(focus) => match focus_tab(&focus.window_id, focus.tab_index) {
+                    Ok(focus) => match focus_tab(browser, &focus.window_id, focus.tab_index) {
                         Ok(()) => respond_json(request, 200, &serde_json::json!({"ok": true})),
                         Err(e) => {
                             eprintln!("error focusing tab: {e}");
@@ -288,11 +278,8 @@ fn main() {
             }
 
             (Method::Get, "/health") => {
-                let guard = tab_cache.lock().unwrap();
-                let age = guard
-                    .as_ref()
-                    .map(|c| format!("{:.1}s ago", c.fetched_at.elapsed().as_secs_f32()))
-                    .unwrap_or_else(|| "not yet fetched".to_string());
+                let guard = tab_cache.read().unwrap();
+                let age = format!("{:.1}s ago", guard.fetched_at.elapsed().as_secs_f32());
                 respond_json(
                     request,
                     200,
