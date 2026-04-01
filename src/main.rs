@@ -1,40 +1,16 @@
 mod bookmarks;
+mod http;
 mod tabs;
 
-use std::io::Cursor;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Method, Server};
 
-use chrome_tabs::{Browser, Bookmark, FocusRequest};
 use bookmarks::load_bookmarks;
+use chrome_tabs::{Bookmark, Browser, FocusRequest};
+use http::{respond_error, respond_json};
 use tabs::{focus_tab, get_cached_tabs, start_tab_refresher, TabCache, CACHE_TTL};
-
-// ── HTTP helpers ─────────────────────────────────────────────────────────────
-
-fn json_header() -> Header {
-    Header::from_bytes("Content-Type", "application/json").unwrap()
-}
-
-fn respond_json<T: serde::Serialize>(request: tiny_http::Request, status: u16, body: &T) {
-    let json = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
-    let response = Response::new(
-        StatusCode(status),
-        vec![json_header()],
-        Cursor::new(json.clone()),
-        Some(json.len()),
-        None,
-    );
-    let _ = request.respond(response);
-}
-
-fn respond_error(request: tiny_http::Request, status: u16, message: &str) {
-    let body = serde_json::json!({ "error": message });
-    respond_json(request, status, &body);
-}
-
-// ── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
     let browser = match std::env::args().nth(1).as_deref() {
