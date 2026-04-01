@@ -1,0 +1,72 @@
+* chrome-tabs
+
+A small macOS HTTP server that exposes your open Chrome tabs and bookmarks as a local JSON API.
+
+** Overview
+
+An Emacs client is available at [[https://github.com/mbuczko/chrome-tabs.el][chrome-tabs.el]].
+
+~chrome-tabs~ runs a lightweight HTTP server on ~127.0.0.1:9223~ and provides three endpoints:
+
+- ~GET /tabs~ — list all open Chrome tabs (cached, refreshed every 10 seconds)
+- ~GET /bookmarks~ — list all Chrome bookmarks (loaded once at startup)
+- ~POST /focus~ — focus a specific tab by window and tab index
+- ~GET /health~ — server health and cache status
+
+Tabs are fetched via JXA (JavaScript for Automation / ~osascript~), so Chrome must be running and macOS automation permissions must be granted.
+
+** Requirements
+
+- macOS (uses ~osascript~ / JXA)
+- Google Chrome
+- Rust toolchain (~cargo~)
+
+** API
+
+*** GET /tabs
+
+Returns a JSON array of open tabs:
+
+#+begin_src json
+[
+  {
+    "title": "Example",
+    "url": "https://example.com",
+    "window_id": "42",
+    "window_index": 0,
+    "tab_index": 0
+  }
+]
+#+end_src
+
+*** GET /bookmarks
+
+Returns a JSON array of bookmarks with folder breadcrumbs:
+
+#+begin_src json
+[
+  {
+    "title": "Example",
+    "url": "https://example.com",
+    "folder": "Bookmarks bar > Dev"
+  }
+]
+#+end_src
+
+*** POST /focus
+
+Focuses a tab. Body:
+
+#+begin_src json
+{ "window_id": "42", "tab_index": 0 }
+#+end_src
+
+Returns ~{"ok": true}~ on success.
+
+*** GET /health
+
+Returns cache age and bookmark count:
+
+#+begin_src json
+{ "ok": true, "tabs_cache": "3.2s ago", "bookmarks_count": 128 }
+#+end_src
