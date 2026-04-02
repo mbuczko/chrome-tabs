@@ -12,7 +12,18 @@ use chrome_tabs::{Bookmark, Browser, FocusRequest};
 use http::{respond_error, respond_json};
 use tabs::{focus_tab, get_cached_tabs, start_tab_refresher, TabCache, CACHE_TTL};
 
+fn check_auth(request: &tiny_http::Request, token: &str) -> bool {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .and_then(|h| h.value.as_str().strip_prefix("Bearer "))
+        == Some(token)
+}
+
 fn main() {
+    let token = std::env::var("CHROME_TABS_TOKEN").expect("CHROME_TABS_TOKEN environment variable is required");
+
     let browser = match std::env::args().nth(1).as_deref() {
         Some("--brave") => Browser::Brave,
         _ => Browser::Chrome,
@@ -38,11 +49,17 @@ fn main() {
     start_tab_refresher(browser, Arc::clone(&tab_cache));
 
     println!("chrome-tabs listening on http://{addr}");
+    println!("  All requests require: Authorization: Bearer <CHROME_TABS_TOKEN>");
     println!("  GET  /tabs         - list open tabs (cached, refreshed every {CACHE_TTL:?})");
     println!("  GET  /bookmarks    - list all bookmarks (loaded once at startup)");
     println!("  POST /focus        - focus a tab, body: {{\"window_index\":0,\"tab_index\":0}}");
 
     for request in server.incoming_requests() {
+        if !check_auth(&request, &token) {
+            respond_error(request, 401, "unauthorized");
+            continue;
+        }
+
         let method = request.method().clone();
         let url = request.url().to_string();
 

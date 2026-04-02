@@ -23,13 +23,23 @@ Tabs are fetched via JXA (JavaScript for Automation / ~osascript~), so the brows
 
 ** Usage
 
+The ~CHROME_TABS_TOKEN~ environment variable is required. All API requests must include it as a Bearer token:
+
 #+begin_src sh
+export CHROME_TABS_TOKEN=your-secret-token
+
 # Google Chrome (default)
 chrome-tabs
 
 # Brave Browser
 chrome-tabs --brave
 #+end_src
+
+Authenticate requests with:
+
+#+begin_example
+Authorization: Bearer your-secret-token
+#+end_example
 
 ** API
 
